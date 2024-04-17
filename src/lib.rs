@@ -2,8 +2,13 @@
 
 #![no_std]
 
-use core::sync::atomic::{AtomicBool, Ordering};
-use cortex_m::{interrupt, register};
+use critical_section::RestoreState;
+
+/// Global logger lock.
+static mut TAKEN: bool = false;
+static mut CS_RESTORE: RestoreState = RestoreState::invalid();
+static mut ENCODER: defmt::Encoder = defmt::Encoder::new();
+
 use rtt_target::UpChannel;
 
 static mut CHANNEL: Option<UpChannel> = None;
@@ -15,24 +20,26 @@ pub fn init(channel: UpChannel) {
     unsafe { CHANNEL = Some(channel) }
 }
 
-/// Global logger lock.
-static TAKEN: AtomicBool = AtomicBool::new(false);
-static INTERRUPTS_ACTIVE: AtomicBool = AtomicBool::new(false);
-static mut ENCODER: defmt::Encoder = defmt::Encoder::new();
-
 unsafe impl defmt::Logger for Logger {
     fn acquire() {
-        let primask = register::primask::read();
-        interrupt::disable();
+        unsafe {
+            // safety: Must be paired with corresponding call to release(), see below
+            let restore = critical_section::acquire();
 
-        if TAKEN.load(Ordering::Relaxed) {
-            panic!("defmt logger taken reentrantly")
+            // safety: accessing the `static mut` is OK because we have acquired a critical
+            // section.
+            if TAKEN {
+                panic!("defmt logger taken reentrantly")
+            }
+
+            // safety: accessing the `static mut` is OK because we have acquired a critical
+            // section.
+            TAKEN = true;
+
+            // safety: accessing the `static mut` is OK because we have acquired a critical
+            // section.
+            CS_RESTORE = restore;
         }
-
-        // no need for CAS because interrupts are disabled
-        TAKEN.store(true, Ordering::Relaxed);
-
-        INTERRUPTS_ACTIVE.store(primask.is_active(), Ordering::Relaxed);
 
         // safety: accessing the `static mut` is OK because we have disabled interrupts.
         unsafe { ENCODER.start_frame(do_write) }
@@ -41,14 +48,18 @@ unsafe impl defmt::Logger for Logger {
     unsafe fn flush() {}
 
     unsafe fn release() {
-        // safety: accessing the `static mut` is OK because we have disabled interrupts.
         ENCODER.end_frame(do_write);
 
-        TAKEN.store(false, Ordering::Relaxed);
-        if INTERRUPTS_ACTIVE.load(Ordering::Relaxed) {
-            // re-enable interrupts
-            interrupt::enable()
-        }
+        // safety: accessing the `static mut` is OK because we have acquired a critical
+        // section.
+        TAKEN = false;
+
+        // safety: accessing the `static mut` is OK because we have acquired a critical
+        // section.
+        let restore = CS_RESTORE;
+
+        // safety: Must be paired with corresponding call to acquire(), see above
+        critical_section::release(restore);
     }
 
     unsafe fn write(bytes: &[u8]) {
